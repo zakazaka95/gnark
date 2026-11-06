@@ -1,0 +1,194 @@
+name: gnark exact-head Linux validation
+
+on:
+  push:
+    branches:
+      - validation/review-ready-2026-11-06
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gnark-review-ready-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.27.3'
+  PR_HEAD: f591df82da30eab1de1d07924e878a29a4df85fd
+  GOMAXPROCS: '4'
+  GOTOOLCHAIN: local
+
+defaults:
+  run:
+    shell: bash
+    working-directory: source
+
+jobs:
+  static:
+    name: full static checks
+    if: github.repository == 'zakazaka95/gnark'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the exact PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: zakazaka95/gnark
+          ref: ${{ env.PR_HEAD }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Verify source identity and record checks
+        run: |
+          set -euo pipefail
+          actual_head=$(git rev-parse HEAD)
+          test "$actual_head" = "$PR_HEAD"
+          test -z "$(git status --porcelain)"
+          {
+            echo '## gnark PR #1916: static checks'
+            printf 'Checked source commit: `%s`\n\n' "$actual_head"
+            printf 'Toolchain: `%s`\n\n' "$(go version)"
+            echo '```sh'
+            echo 'gofmt -l .'
+            echo 'go tool goimports -l .'
+            echo 'go generate ./...'
+            echo 'git diff / untracked-file check (excluding go.mod and go.sum, matching upstream)'
+            echo 'golangci-lint v2.14.0 run -v --timeout=5m'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Check gofmt
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [[ -n "$unformatted" ]]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Check goimports
+        run: |
+          set -euo pipefail
+          unformatted=$(go tool goimports -l .)
+          if [[ -n "$unformatted" ]]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Check generated files
+        run: |
+          set -euo pipefail
+          generation_status=0
+          go generate ./... || generation_status=$?
+          changed_files=$(git diff --name-only -- . ':(exclude)go.mod' ':(exclude)go.sum')
+          untracked_files=$(git ls-files --others --exclude-standard -- . ':(exclude)go.mod' ':(exclude)go.sum')
+          printf '\nGenerator exit code: `%s`\n' "$generation_status" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$generation_status" -ne 0 || -n "$changed_files" || -n "$untracked_files" ]]; then
+            echo 'Generation failed or changed tracked/untracked source files.'
+            git status --porcelain
+            git diff --stat -- . ':(exclude)go.mod' ':(exclude)go.sum'
+            git diff -- . ':(exclude)go.mod' ':(exclude)go.sum'
+            {
+              echo
+              echo 'Generated-source check: failed'
+              echo '```text'
+              printf '%s\n%s\n' "$changed_files" "$untracked_files"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          printf '\nGenerated-source check: passed\n' >> "$GITHUB_STEP_SUMMARY"
+      - name: Full pinned golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a
+        with:
+          version: v2.14.0
+          working-directory: source
+          args: -v --timeout=5m
+          skip-cache: true
+      - name: Record job result
+        if: always()
+        working-directory: ${{ github.workspace }}
+        run: |
+          printf '\nStatic job result: `%s`\n' '${{ job.status }}' >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    name: ${{ matrix.name }}
+    if: github.repository == 'zakazaka95/gnark'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: full short suite
+            solc: false
+            command: go test -short -json -v -p 2 -timeout=30m ./...
+          - name: release and Solidity checks
+            solc: true
+            command: go test -short -json -v -p 2 -timeout=30m -tags=release_checks,solccheck .
+          - name: prover checks in test
+            solc: false
+            command: go test -short -json -v -p 2 -timeout=30m -tags=prover_checks ./test/...
+          - name: prover checks in examples
+            solc: false
+            command: go test -short -json -v -p 2 -timeout=30m -tags=prover_checks ./examples/...
+          - name: integer-compression fuzz check
+            solc: false
+            command: go test -short -json -v -timeout=30m -run=NONE -fuzz=FuzzIntcomp -fuzztime=10s ./internal/backend/ioutils
+    # Independent jobs retain complete test evidence if a static baseline check fails.
+    steps:
+      - name: Check out the exact PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: zakazaka95/gnark
+          ref: ${{ env.PR_HEAD }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Verify source identity and record command
+        env:
+          CHECK_NAME: ${{ matrix.name }}
+          CHECK_COMMAND: ${{ matrix.command }}
+        run: |
+          set -euo pipefail
+          actual_head=$(git rev-parse HEAD)
+          test "$actual_head" = "$PR_HEAD"
+          test -z "$(git status --porcelain)"
+          {
+            printf '## gnark PR #1916: %s\n\n' "$CHECK_NAME"
+            printf 'Checked source commit: `%s`\n\n' "$actual_head"
+            printf 'Toolchain: `%s`\n\n' "$(go version)"
+            echo '```sh'
+            printf '%s\n' "$CHECK_COMMAND"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Install native solc
+        if: matrix.solc
+        run: |
+          set -euo pipefail
+          sudo add-apt-repository -y ppa:ethereum/ethereum
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends solc
+          solc --version
+          {
+            echo
+            echo '```text'
+            solc --version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run complete check
+        run: |
+          set -euo pipefail
+          ${{ matrix.command }}
+      - name: Record job result
+        if: always()
+        working-directory: ${{ github.workspace }}
+        run: |
+          printf '\nTest job result: `%s`\n' '${{ job.status }}' >> "$GITHUB_STEP_SUMMARY"
